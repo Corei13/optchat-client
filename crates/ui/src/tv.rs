@@ -20,7 +20,12 @@ pub fn enabled() -> bool {
 }
 pub fn enable() {
     TV.store(true, Ordering::Relaxed);
+    // engine traffic (tickers, streaming text of running tasks) redraws at most ~3×/s on the tv
+    optchat_client::state::set_engine_redraw_gap(ENGINE_REDRAW_GAP_MS);
 }
+
+/// see `enable`; dev builds can override it (`OC_ENGINE_REDRAW_GAP_MS`) for A/B
+pub const ENGINE_REDRAW_GAP_MS: u64 = 300;
 
 /// the remote's keys, in the workspace (they win over the desktop bindings: bound after them)
 pub fn bind(cx: &mut App) {

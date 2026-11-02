@@ -178,6 +178,8 @@ mod imp {
             }
             if let Some(m) = v["skip"].as_u64() {
                 gpui_wgpu::perf::set_skip(m as u32);
+                // A/B bit 4096: engine redraws uncapped
+                optchat_client::state::set_engine_redraw_gap(if m & 4096 != 0 { 0 } else { optchat_ui::tv::ENGINE_REDRAW_GAP_MS });
             }
             if v["perf"].as_bool() == Some(true) {
                 let j = perf_sample();
