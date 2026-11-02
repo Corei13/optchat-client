@@ -434,6 +434,7 @@ fn regex_lite(_: &str) -> impl Fn(&str) -> bool {
 
 impl Render for Feed {
     fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _t = crate::ui::rtime::guard("feed");
         crate::ui::anim::area(crate::ui::anim::FEED);
         // row probes are re-recorded by the rows rendered in this frame: drop the ones scrolled out of range
         if crate::ui::probes_on() {
@@ -505,6 +506,7 @@ impl Feed {
     }
 
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let _t = crate::ui::rtime::guard("feedRow");
         let Some(row) = self.rows.get(ix).cloned() else { return div().into_any_element() };
         crate::markdown::set_compact(self.compact);
         let first = ix == 0;

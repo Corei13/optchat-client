@@ -410,6 +410,7 @@ impl Composer {
 
 impl Render for Composer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _t = crate::ui::rtime::guard("composer");
         crate::ui::anim::area(crate::ui::anim::WORKSPACE);
         let k = c(cx).clone();
         let s = self.state.read(cx);

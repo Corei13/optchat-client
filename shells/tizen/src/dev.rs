@@ -29,9 +29,97 @@ mod imp {
         req.extend_from_slice(body);
         http(8767, &req).is_some()
     }
+    /// log line to the mac (:8765), sent from its own thread: a synchronous http round trip on the ui thread
+    /// would show up in every frame / input measurement
     pub fn beacon(m: &str) {
-        let enc: String = m.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect();
-        let _ = http(8765, format!("GET /?m=gpui+{enc} HTTP/1.0\r\nHost: x\r\n\r\n").as_bytes());
+        static TX: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<String>>> = OnceLock::new();
+        let tx = TX.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                for m in rx {
+                    let enc: String = m.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect();
+                    let _ = http(8765, format!("GET /?m=gpui+{enc} HTTP/1.0\r\nHost: x\r\n\r\n").as_bytes());
+                }
+            });
+            std::sync::Mutex::new(tx)
+        });
+        let _ = tx.lock().unwrap().send(m.to_string());
+    }
+    /// dev perf sample: the renderer's frame / input counters (gpui_wgpu perf-counters) plus this process's cpu and
+    /// memory and the busiest other processes, all since the previous sample
+    fn perf_sample() -> serde_json::Value {
+        optchat_ui::ui::rtime::ON.store(true, std::sync::atomic::Ordering::Relaxed);
+        use std::collections::HashMap;
+        static PREV: OnceLock<std::sync::Mutex<(u64, HashMap<u32, (u64, String)>)>> = OnceLock::new();
+        let total = || -> u64 {
+            std::fs::read_to_string("/proc/stat").ok().and_then(|s| s.lines().next().map(|l| l.split_whitespace().skip(1).filter_map(|x| x.parse::<u64>().ok()).sum())).unwrap_or(0)
+        };
+        let proc_ticks = |pid: &str| -> Option<(u64, String)> {
+            let st = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let comm = st[st.find('(')? + 1..st.rfind(')')?].to_string();
+            let f: Vec<&str> = st[st.rfind(')')? + 2..].split(' ').collect();
+            Some((f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?, comm))
+        };
+        let me = std::process::id();
+        let mut now: HashMap<u32, (u64, String)> = HashMap::new();
+        if let Ok(rd) = std::fs::read_dir("/proc") {
+            for e in rd.flatten() {
+                let n = e.file_name();
+                let Some(pid) = n.to_str().and_then(|x| x.parse::<u32>().ok()) else { continue };
+                if let Some(t) = proc_ticks(&pid.to_string()) {
+                    now.insert(pid, t);
+                }
+            }
+        }
+        let tot = total();
+        let ncpu = std::fs::read_to_string("/proc/stat").map(|s| s.lines().filter(|l| l.starts_with("cpu") && !l.starts_with("cpu ")).count()).unwrap_or(1).max(1);
+        let m = PREV.get_or_init(|| std::sync::Mutex::new((0, HashMap::new())));
+        let mut g = m.lock().unwrap();
+        let dt = tot.saturating_sub(g.0).max(1) as f64; // all cpus' ticks
+        let pct = |pid: &u32, t: u64| -> f64 { g.1.get(pid).map(|p| t.saturating_sub(p.0)).unwrap_or(0) as f64 * 100.0 * ncpu as f64 / dt };
+        let mut top: Vec<(f64, u32, String)> = now.iter().map(|(pid, (t, c))| (pct(pid, *t), *pid, c.clone())).filter(|x| x.0 > 0.5).collect();
+        top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let self_pct = now.get(&me).map(|(t, _)| pct(&me, *t)).unwrap_or(0.0);
+        let first = g.0 == 0;
+        *g = (tot, now);
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let field = |k: &str| status.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok());
+        let mut threads: Vec<(f64, String)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir("/proc/self/task") {
+            static TPREV: OnceLock<std::sync::Mutex<HashMap<String, u64>>> = OnceLock::new();
+            let tp = TPREV.get_or_init(Default::default);
+            let mut tp = tp.lock().unwrap();
+            for e in rd.flatten() {
+                let id = e.file_name().to_string_lossy().to_string();
+                if let Some((t, c)) = proc_ticks(&format!("self/task/{id}")) {
+                    let d = t.saturating_sub(*tp.get(&id).unwrap_or(&t));
+                    tp.insert(id.clone(), t);
+                    if d > 0 {
+                        threads.push((d as f64 * 100.0 * ncpu as f64 / dt, format!("{c}/{id}")));
+                    }
+                }
+            }
+        }
+        threads.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let gpu: Option<serde_json::Value> = gpui_wgpu::perf::take().and_then(|j| serde_json::from_str(&j).ok());
+        let ui_scroll = optchat_ui::ui::frame_summary();
+        optchat_ui::ui::reset_frames();
+        serde_json::json!({
+            "t": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+            "first": first,
+            "ncpu": ncpu,
+            "selfCpuPct": (self_pct * 10.0).round() / 10.0, // of one core
+            "rssKb": field("VmRSS:"), "hwmKb": field("VmHWM:"), "threads": field("Threads:"),
+            "topThreads": threads.iter().take(6).map(|(p, n)| format!("{n} {:.1}", p)).collect::<Vec<_>>(),
+            "topProcs": top.iter().take(8).map(|(p, pid, c)| format!("{c}/{pid} {:.1}", p)).collect::<Vec<_>>(),
+            "loadavg": std::fs::read_to_string("/proc/loadavg").unwrap_or_default().trim(),
+            "gpu": gpu,
+            // the shared ui's own scroll-frame stats (crates/ui/src/ui.rs frame_probe): render-to-paint work per frame
+            "uiScroll": ui_scroll,
+            "views": optchat_ui::ui::rtime::take(),
+            "cpuFeatures": std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|c| c.lines().find(|l| l.starts_with("Features")).map(|l| l.to_string())),
+            "cpuPart": std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|c| c.lines().find(|l| l.starts_with("CPU part")).map(|l| l.to_string())),
+        })
     }
     pub fn fake_clip() -> Option<Vec<u8>> {
         if !FAKE.load(std::sync::atomic::Ordering::SeqCst) {
@@ -87,6 +175,13 @@ mod imp {
             if v["shot"].as_bool() == Some(true) {
                 gpui_wgpu::frame_capture::request_capture();
                 queue_cmds(&[serde_json::json!({ "op": "redraw" })]);
+            }
+            if let Some(m) = v["skip"].as_u64() {
+                gpui_wgpu::perf::set_skip(m as u32);
+            }
+            if v["perf"].as_bool() == Some(true) {
+                let j = perf_sample();
+                post("/perf", "application/json", j.to_string().as_bytes());
             }
             if v["state"].as_bool() == Some(true) {
                 std::thread::sleep(std::time::Duration::from_millis(300));

@@ -15,6 +15,41 @@ pub fn icon(name: &str, size: f32, color: Hsla) -> Svg {
 // A 60 fps animation redraws the whole window every frame (the platform draw dominates, ~25% CPU while a
 // "summarizing" spinner shows). These are driven by the clock instead and redrawn by a 20 Hz ticker
 // (Workspace::start_ticker) that notifies only the views that drew one in their last render.
+/// dev perf: wall time of view render() calls (element building only, not layout/paint), read by the tizen
+/// dev build's perf sample. Cheap (a thread-local push) and only summarised when taken.
+pub mod rtime {
+    static T: std::sync::Mutex<Vec<(&'static str, Vec<f32>)>> = std::sync::Mutex::new(Vec::new());
+    /// off unless a dev perf build turns it on (tizen `--perf`): then guards record
+    pub static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    pub struct Guard(&'static str, Option<std::time::Instant>);
+    pub fn guard(name: &'static str) -> Guard {
+        Guard(name, ON.load(std::sync::atomic::Ordering::Relaxed).then(std::time::Instant::now))
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let Some(t0) = self.1 else { return };
+            let d = t0.elapsed().as_secs_f32() * 1000.0;
+            let mut t = T.lock().unwrap();
+            match t.iter_mut().find(|x| x.0 == self.0) {
+                Some(x) => x.1.push(d),
+                None => t.push((self.0, vec![d])),
+            }
+        }
+    }
+    /// {name: {n, p50, max}} since the last take
+    pub fn take() -> serde_json::Value {
+        {
+            let mut m = serde_json::Map::new();
+            for (n, mut v) in T.lock().unwrap().drain(..) {
+                v.sort_by(|a, b| a.total_cmp(b));
+                let p50 = v[v.len() / 2];
+                m.insert(n.to_string(), serde_json::json!({ "n": v.len(), "p50": p50, "max": v[v.len() - 1] }));
+            }
+            serde_json::Value::Object(m)
+        }
+    }
+}
+
 pub mod anim {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -48,6 +83,10 @@ pub mod anim {
 }
 
 pub fn spinner(_id: impl Into<ElementId>, size: f32, color: Hsla) -> impl IntoElement {
+    // tv: a full redraw costs ~100 ms on the mali gpu, so spinners and pulses stand still there (no idle redraw)
+    if crate::tv::enabled() {
+        return icon("loader-circle", size, color).with_transformation(Transformation::rotate(percentage(0.0)));
+    }
     anim::want();
     // 12 steps of 30° per second, in step with the 12.5 Hz ticker
     let turn = ((anim::clock() * 12.0).floor() / 12.0).fract();
@@ -56,6 +95,9 @@ pub fn spinner(_id: impl Into<ElementId>, size: f32, color: Hsla) -> impl IntoEl
 
 /// A soft pulse (opacity) for "live" dots.
 pub fn pulse<E: IntoElement + Styled + 'static>(_id: impl Into<ElementId>, el: E) -> impl IntoElement {
+    if crate::tv::enabled() {
+        return el.opacity(1.0);
+    }
     anim::want();
     let d = (anim::clock() / 1.2 * std::f32::consts::TAU).cos() * 0.5 + 0.5;
     el.opacity(0.35 + 0.65 * d)

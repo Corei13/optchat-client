@@ -3,6 +3,7 @@
 #   --dev-capture   dev build: screenshots, test channel, fake mic, logs via the mac dev server (never ship it)
 #   --seed FILE     dev build: FILE (json {engines:[{endpoint,name,ws,token}],active}) goes in as res/dev-seed.json;
 #                   it holds tokens: kept 0600, git-ignored, removed from the tree after packaging
+#   --perf          dev-only: frame / input / cpu counters through the dev channel (tvdev.py perf); implies dev-capture
 #   --theme-preview temporary: cycle all themes every 15 s with the name on top (to pick one)
 #   --no-install    stop after packaging
 set -e
@@ -12,6 +13,7 @@ FEAT=""; SEED=""; prev=""
 for a in "$@"; do
   [ "$a" = "--dev-capture" ] && FEAT="$FEAT dev-capture"
   [ "$a" = "--theme-preview" ] && FEAT="$FEAT theme-preview"
+  [ "$a" = "--perf" ] && FEAT="$FEAT perf"
   [ "$prev" = "--seed" ] && SEED="$a"
   prev="$a"
 done

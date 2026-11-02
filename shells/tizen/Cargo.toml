@@ -31,3 +31,6 @@ default = []
 dev-capture = ["gpui_wgpu/frame-capture", "dep:image"]
 # temporary: cycle every bundled theme (15 s each, name on top) to pick the tv's theme. `build.sh --theme-preview`
 theme-preview = []
+# dev-only: frame / input counters in the renderer (gpui_wgpu perf-counters), sampled with cpu / memory through the
+# dev channel (`tvdev.py perf`). `build.sh --dev-capture --perf`
+perf = ["dev-capture", "gpui_wgpu/perf-counters"]

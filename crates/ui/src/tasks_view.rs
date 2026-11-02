@@ -31,6 +31,7 @@ impl TasksPanel {
 }
 impl Render for TasksPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _t = crate::ui::rtime::guard("tasks");
         // a cached view is laid out at the size its parent gives it, so the panel scrolls itself
         crate::ui::anim::area(crate::ui::anim::TASKS);
         let body = self.body(window, cx).into_any_element();
