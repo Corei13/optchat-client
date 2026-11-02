@@ -124,6 +124,9 @@ pub extern "C" fn oc_main() -> i32 {
     // the whole ui at 1.5× (a 1280×720 layout on the 1080p panel): read from across a room, every view alike
     unsafe { std::env::set_var("GPUI_TIZEN_SCALE", TV_SCALE.to_string()) };
     let data = data_dir();
+    // linked gl program binaries kept across starts (vendor/wgpu-hal gles): the Mali compile + link of gpui's
+    // pipelines is ~2.4 s of a cold start, a cached binary loads in a few ms
+    unsafe { std::env::set_var("WGPU_GLES_PROGRAM_CACHE_DIR", format!("{data}/gl-programs")) };
     beacon(&format!("oc_main start data={data}"));
     dev::init(&data);
     let mic = MIC.get_or_init(|| Arc::new(platform::RemoteMic::default())).clone();
