@@ -442,10 +442,10 @@ index 0000000..13d8018
 +}
 diff --git a/crates/gpui_wgpu/src/quad_cull.rs b/crates/gpui_wgpu/src/quad_cull.rs
 new file mode 100644
-index 0000000..6e32e88
+index 0000000..ab3c71c
 --- /dev/null
 +++ b/crates/gpui_wgpu/src/quad_cull.rs
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,170 @@
 +//! Overdraw culling for opaque nested backgrounds (optchat tizen perf).
 +//!
 +//! UIs often paint the same opaque background several times: window, pane, list, composer. On weak tilers (the
@@ -597,24 +597,44 @@ index 0000000..6e32e88
 +}
 +
 +/// quads fs_quad_simple draws exactly like fs_quad: solid background, square corners, no border
++/// solid background and solid border, any radii / border widths: fs_quad_lean (no gradient, no dashes)
++pub fn lean(q: &Quad) -> bool {
++    q.background.as_solid().is_some() && matches!(q.border_style, gpui::BorderStyle::Solid)
++}
++
++/// 0 simple, 1 lean, 2 full fs_quad
++pub fn kind(q: &Quad) -> u8 {
++    if simple(q) {
++        0
++    } else if lean(q) && !crate::perf::skip(2048) {
++        1
++    } else {
++        2
++    }
++}
++
 +pub fn simple(q: &Quad) -> bool {
 +    q.background.as_solid().is_some() && square(q) && plain(q)
 +}
 diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wgsl
-index 718cb75..c976573 100644
+index 718cb75..2472466 100644
 --- a/crates/gpui_wgpu/src/shaders.wgsl
 +++ b/crates/gpui_wgpu/src/shaders.wgsl
-@@ -536,6 +536,9 @@ struct QuadVarying {
+@@ -536,6 +536,13 @@ struct QuadVarying {
      @location(3) @interpolate(flat) background_solid: vec4<f32>,
      @location(4) @interpolate(flat) background_color0: vec4<f32>,
      @location(5) @interpolate(flat) background_color1: vec4<f32>,
 +    // Device-space rect (x0, y0, x1, y1) whose pixels are plain solid background: lets fs_quad skip
 +    // load_quad, which on the WebGL/GLES instance-texture path costs 10 texel fetches per pixel.
 +    @location(6) @interpolate(flat) solid_inner: vec4<f32>,
++    // fs_quad_lean's quad (no load_quad there): bounds (origin, size), radii (tl, tr, br, bl), borders (t, r, b, l)
++    @location(7) @interpolate(flat) q_bounds: vec4<f32>,
++    @location(8) @interpolate(flat) q_radii: vec4<f32>,
++    @location(9) @interpolate(flat) q_borders: vec4<f32>,
  }
  
  @vertex
-@@ -558,9 +561,33 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
+@@ -558,9 +565,101 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
      out.border_color = hsla_to_rgba(quad.border_color);
      out.quad_id = instance_id;
      out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
@@ -632,9 +652,77 @@ index 718cb75..c976573 100644
 +                          quad.bounds.origin + quad.bounds.size - vec2<f32>(inset));
 +    }
 +    out.solid_inner = inner;
++    out.q_bounds = vec4<f32>(quad.bounds.origin, quad.bounds.size);
++    let cr = quad.corner_radii;
++    out.q_radii = vec4<f32>(cr.top_left, cr.top_right, cr.bottom_right, cr.bottom_left);
++    let bw = quad.border_widths;
++    out.q_borders = vec4<f32>(bw.top, bw.right, bw.bottom, bw.left);
      return out;
  }
  
++// Rounded and / or bordered quads with a solid background and a solid border (quad_cull::lean): fs_quad's SDF
++// without load_quad, gradients or dashes. On the TV's Mali-G31 the full fs_quad cost ~23 ms a frame for 0.13
++// screens of such quads (register pressure of the big shader), whatever branch the pixels took.
++@fragment
++fn fs_quad_lean(input: QuadVarying) -> @location(0) vec4<f32> {
++    if (any(input.clip_distances < vec4<f32>(0.0))) {
++        return vec4<f32>(0.0);
++    }
++    let p = input.position.xy;
++    let background_color = input.background_solid;
++    if (p.x >= input.solid_inner.x && p.y >= input.solid_inner.y &&
++            p.x <= input.solid_inner.z && p.y <= input.solid_inner.w) {
++        return blend_color(background_color, 1.0);
++    }
++    let radii = Corners(input.q_radii.x, input.q_radii.y, input.q_radii.z, input.q_radii.w);
++    let size = input.q_bounds.zw;
++    let half_size = size / 2.0;
++    let point = p - input.q_bounds.xy;
++    let center_to_point = point - half_size;
++    let antialias_threshold = 0.5;
++    let corner_radius = pick_corner_radius(center_to_point, radii);
++    let border = vec2<f32>(
++        select(input.q_borders.y, input.q_borders.w, center_to_point.x < 0.0),
++        select(input.q_borders.z, input.q_borders.x, center_to_point.y < 0.0));
++    let reduced_border =
++        vec2<f32>(select(border.x, -antialias_threshold, border.x == 0.0),
++                  select(border.y, -antialias_threshold, border.y == 0.0));
++    let corner_to_point = abs(center_to_point) - half_size;
++    let corner_center_to_point = corner_to_point + corner_radius;
++    let is_near_rounded_corner = corner_center_to_point.x >= 0 && corner_center_to_point.y >= 0;
++    let straight_border_inner_corner_to_point = corner_to_point + reduced_border;
++    let is_beyond_inner_straight_border =
++            straight_border_inner_corner_to_point.x > 0 ||
++            straight_border_inner_corner_to_point.y > 0;
++    let is_within_inner_straight_border =
++        straight_border_inner_corner_to_point.x < -antialias_threshold &&
++        straight_border_inner_corner_to_point.y < -antialias_threshold;
++    if (is_within_inner_straight_border && !is_near_rounded_corner) {
++        return blend_color(background_color, 1.0);
++    }
++    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
++    var inner_sdf = 0.0;
++    if (corner_center_to_point.x <= 0 || corner_center_to_point.y <= 0) {
++        inner_sdf = -max(straight_border_inner_corner_to_point.x,
++                         straight_border_inner_corner_to_point.y);
++    } else if (is_beyond_inner_straight_border) {
++        inner_sdf = -1.0;
++    } else if (reduced_border.x == reduced_border.y) {
++        inner_sdf = -(outer_sdf + reduced_border.x);
++    } else {
++        let ellipse_radii = max(vec2<f32>(0.0), corner_radius - reduced_border);
++        inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
++    }
++    let border_sdf = max(inner_sdf, outer_sdf);
++    var color = background_color;
++    if (border_sdf < antialias_threshold) {
++        let blended_border = over(background_color, input.border_color);
++        color = mix(background_color, blended_border,
++                    saturate(antialias_threshold - inner_sdf));
++    }
++    return blend_color(color, saturate(antialias_threshold - outer_sdf));
++}
++
 +// Lean variant for square, borderless, solid-background quads (picked on the CPU, see quad_cull::simple): no
 +// load_quad and none of the SDF code, so weak GPUs keep their registers for the big pane fills.
 +@fragment
@@ -648,7 +736,7 @@ index 718cb75..c976573 100644
  @fragment
  fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
      // Alpha clip first, since we don't have `clip_distance`.
-@@ -568,6 +595,12 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
+@@ -568,6 +667,12 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
          return vec4<f32>(0.0);
      }
  
@@ -662,18 +750,19 @@ index 718cb75..c976573 100644
  
      let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
 diff --git a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
-index bfb081f..7153e91 100644
+index bfb081f..77479d1 100644
 --- a/crates/gpui_wgpu/src/wgpu_renderer.rs
 +++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
-@@ -125,6 +125,7 @@ pub struct WgpuSurfaceConfig {
+@@ -125,6 +125,8 @@ pub struct WgpuSurfaceConfig {
  
  struct WgpuPipelines {
      quads: wgpu::RenderPipeline,
 +    quads_simple: wgpu::RenderPipeline,
++    quads_lean: wgpu::RenderPipeline,
      shadows: wgpu::RenderPipeline,
      path_rasterization: wgpu::RenderPipeline,
      paths: wgpu::RenderPipeline,
-@@ -691,6 +692,8 @@ impl WgpuRendererCore {
+@@ -691,6 +693,8 @@ impl WgpuRendererCore {
          } else {
              STORAGE_BUFFER_SHADERS
          };
@@ -682,7 +771,7 @@ index bfb081f..7153e91 100644
          let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
              label: Some("gpui_shaders"),
              source: wgpu::ShaderSource::Wgsl(shader_source.into()),
-@@ -728,6 +731,8 @@ impl WgpuRendererCore {
+@@ -728,6 +732,8 @@ impl WgpuRendererCore {
                                 color_targets: &[Option<wgpu::ColorTargetState>],
                                 sample_count: u32,
                                 module: &wgpu::ShaderModule| {
@@ -691,7 +780,7 @@ index bfb081f..7153e91 100644
              let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
              bind_group_layouts.extend(texture_layout.map(Some));
              let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-@@ -784,6 +789,19 @@ impl WgpuRendererCore {
+@@ -784,6 +790,32 @@ impl WgpuRendererCore {
              &shader_module,
          );
  
@@ -708,34 +797,59 @@ index bfb081f..7153e91 100644
 +            &shader_module,
 +        );
 +
++        let quads_lean = create_pipeline(
++            "quads_lean",
++            "vs_quad",
++            "fs_quad_lean",
++            &layouts.globals,
++            &layouts.instances,
++            None,
++            wgpu::PrimitiveTopology::TriangleStrip,
++            &[Some(color_target.clone())],
++            1,
++            &shader_module,
++        );
++
          let shadows = create_pipeline(
              "shadows",
              "vs_shadow",
-@@ -932,6 +950,7 @@ impl WgpuRendererCore {
+@@ -932,6 +964,8 @@ impl WgpuRendererCore {
  
          WgpuPipelines {
              quads,
 +            quads_simple,
++            quads_lean,
              shadows,
              path_rasterization,
              paths,
-@@ -1121,6 +1140,43 @@ impl WgpuRenderer {
+@@ -1121,6 +1155,57 @@ impl WgpuRenderer {
      }
  
      pub fn draw(&mut self, scene: &Scene) -> bool {
 +        if crate::perf::ENABLED {
 +            let _ = gpui::perf_hook::HOOK.set(crate::perf::sample);
 +            crate::perf::sample("nQuads", scene.quads.len() as f32);
++            crate::perf::sample("nDrawInstanced", OC_DRAWS.swap(0, std::sync::atomic::Ordering::Relaxed) as f32);
++            crate::perf::sample("nBatches", scene.batches().count() as f32);
 +            crate::perf::sample("nShadows", scene.shadows.len() as f32);
 +            crate::perf::sample("nPaths", scene.paths.len() as f32);
 +            crate::perf::sample("nMono", scene.monochrome_sprites.len() as f32);
 +            crate::perf::sample("nSubpx", scene.subpixel_sprites.len() as f32);
 +            crate::perf::sample("nPoly", scene.polychrome_sprites.len() as f32);
-+            let (mut area, mut tarea, mut nt, mut nb, mut big) = (0f32, 0f32, 0f32, 0f32, 0f32);
++            let (mut area, mut tarea, mut nt, mut nb, mut big, mut farea) = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
 +            for q in &scene.quads {
 +                let v = q.bounds.intersect(&q.content_mask.bounds);
 +                let a = v.size.width.0.max(0.0) * v.size.height.0.max(0.0);
 +                area += a;
++                if !crate::quad_cull::simple(q) {
++                    farea += a;
++                    if a > 20_000.0 {
++                        static F: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++                        if F.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 600 < 20 {
++                            log::info!("perf fullquad o={} {:?} bg {:?} border {:?} r {:?}", q.order, v.size, q.background.as_solid(), q.border_widths, q.corner_radii);
++                        }
++                    }
++                }
 +                if q.background.is_transparent() { tarea += a; nt += 1.0; }
 +                if q.border_widths.top.0 + q.border_widths.left.0 + q.border_widths.right.0 + q.border_widths.bottom.0 > 0.0 { nb += 1.0; }
 +                if a > 100_000.0 {
@@ -748,6 +862,9 @@ index bfb081f..7153e91 100644
 +            }
 +            let screen = (1920.0 * 1080.0) as f32;
 +            crate::perf::sample("quadScreens", area / screen);
++            crate::perf::sample("quadFullScreens", farea / screen);
++            crate::perf::sample("nLean", scene.quads.iter().filter(|q| crate::quad_cull::kind(q) == 1).count() as f32);
++            crate::perf::sample("nFull", scene.quads.iter().filter(|q| crate::quad_cull::kind(q) == 2).count() as f32);
 +            crate::perf::sample("quadTranspScreens", tarea / screen);
 +            crate::perf::sample("nQuadTransp", nt);
 +            crate::perf::sample("nQuadBorder", nb);
@@ -763,7 +880,7 @@ index bfb081f..7153e91 100644
          #[cfg(target_family = "wasm")]
          if self.device_lost() {
              if matches!(self.state, RendererState::Ready { .. }) {
-@@ -1164,6 +1220,7 @@ impl WgpuRenderer {
+@@ -1164,6 +1249,7 @@ impl WgpuRenderer {
              self.failed_frame_count = 0;
          }
  
@@ -771,7 +888,7 @@ index bfb081f..7153e91 100644
          let frame = match surface.get_current_texture() {
              wgpu::CurrentSurfaceTexture::Success(frame) => frame,
              wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-@@ -1194,6 +1251,8 @@ impl WgpuRenderer {
+@@ -1194,6 +1280,8 @@ impl WgpuRenderer {
          let frame_view = frame
              .texture
              .create_view(&wgpu::TextureViewDescriptor::default());
@@ -780,7 +897,7 @@ index bfb081f..7153e91 100644
          let premultiplied_alpha =
              self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
          if let Err(error) = core.render_frame(
-@@ -1207,7 +1266,10 @@ impl WgpuRenderer {
+@@ -1207,7 +1295,10 @@ impl WgpuRenderer {
              return false;
          }
  
@@ -791,7 +908,7 @@ index bfb081f..7153e91 100644
          #[cfg(feature = "frame-capture")]
          if let Some(sink) = crate::frame_capture::take_request() {
              match core.capture_frame(scene, size, premultiplied_alpha) {
-@@ -1284,6 +1346,8 @@ impl WgpuRendererCore {
+@@ -1284,6 +1375,8 @@ impl WgpuRendererCore {
          let dual_source_blending =
              context.supports_dual_source_blending() && !uses_webgl_instance_data;
          let bind_group_layouts = Self::create_bind_group_layouts(&device, uses_webgl_instance_data);
@@ -800,7 +917,7 @@ index bfb081f..7153e91 100644
          let pipelines = Self::create_pipelines(
              &device,
              &bind_group_layouts,
-@@ -1526,6 +1590,10 @@ impl WgpuRendererCore {
+@@ -1526,6 +1619,10 @@ impl WgpuRendererCore {
              bytemuck::bytes_of(&gamma_params),
          );
  
@@ -811,7 +928,7 @@ index bfb081f..7153e91 100644
          self.record_frame(scene, target_view, clear_color)
              .inspect_err(|_| {
                  // Queue writes are staged before encoding; flush them even if the frame fails.
-@@ -1581,18 +1649,40 @@ impl WgpuRendererCore {
+@@ -1581,18 +1678,43 @@ impl WgpuRendererCore {
  
              for batch in scene.batches() {
                  match batch {
@@ -827,15 +944,18 @@ index bfb081f..7153e91 100644
 +                        // runs of simple / full quads, in order, each with its own pipeline
 +                        let mut start = range.start;
 +                        while start < range.end {
-+                            let simple = crate::quad_cull::simple(&scene.quads[start]);
++                            let kind = crate::quad_cull::kind(&scene.quads[start]);
++                            let simple = kind == 0;
 +                            let mut end = start + 1;
-+                            while end < range.end && crate::quad_cull::simple(&scene.quads[end]) == simple {
++                            while end < range.end && crate::quad_cull::kind(&scene.quads[end]) == kind {
 +                                end += 1;
 +                            }
 +                            let pipelines = &self.resources().pipelines;
++                            if !simple && crate::perf::skip(512) { start = end; continue; }
++                            if simple && crate::perf::skip(1024) { start = end; continue; }
 +                            self.draw_instances(
 +                                &instance_bindings.quads,
-+                                if simple { &pipelines.quads_simple } else { &pipelines.quads },
++                                match kind { 0 => &pipelines.quads_simple, 1 => &pipelines.quads_lean, _ => &pipelines.quads },
 +                                instance_range(start..end),
 +                                &mut pass,
 +                            );
@@ -853,7 +973,7 @@ index bfb081f..7153e91 100644
                      PrimitiveBatch::Paths(range) => {
                          let paths = &scene.paths[range];
                          if paths.is_empty() {
-@@ -1629,12 +1719,14 @@ impl WgpuRendererCore {
+@@ -1629,12 +1751,14 @@ impl WgpuRendererCore {
                              )?;
                          }
                      }
@@ -868,7 +988,7 @@ index bfb081f..7153e91 100644
                      PrimitiveBatch::MonochromeSprites { texture_id, range } => {
                          self.draw_sprites(
                              &instance_bindings.monochrome_sprites,
-@@ -1644,6 +1736,7 @@ impl WgpuRendererCore {
+@@ -1644,6 +1768,7 @@ impl WgpuRendererCore {
                              &mut pass,
                          )?;
                      }
@@ -876,7 +996,7 @@ index bfb081f..7153e91 100644
                      PrimitiveBatch::SubpixelSprites { texture_id, range } => {
                          let resources = self.resources();
                          self.draw_sprites(
-@@ -1658,6 +1751,7 @@ impl WgpuRendererCore {
+@@ -1658,6 +1783,7 @@ impl WgpuRendererCore {
                              &mut pass,
                          )?;
                      }
@@ -884,11 +1004,27 @@ index bfb081f..7153e91 100644
                      PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                          self.draw_sprites(
                              &instance_bindings.polychrome_sprites,
-@@ -1686,11 +1780,12 @@ impl WgpuRendererCore {
+@@ -1686,11 +1812,28 @@ impl WgpuRendererCore {
          scene: &Scene,
          instance_offset: &mut u64,
      ) -> Result<InstanceBindings> {
 +        let culled = crate::quad_cull::cull(scene);
++        if crate::perf::ENABLED {
++            let (mut a, mut n) = (0f32, 0f32);
++            for q in culled.as_deref().unwrap_or(&scene.quads) {
++                let v = q.bounds.intersect(&q.content_mask.bounds);
++                let x = v.size.width.0.max(0.0) * v.size.height.0.max(0.0);
++                if x > 0.0 { a += x; n += 1.0; }
++                if x > 200_000.0 {
++                    static D: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++                    if D.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 600 < 12 {
++                        log::info!("perf drawnbig o={} {:?} {:?} bg {:?}", q.order, v.origin, v.size, q.background.as_solid());
++                    }
++                }
++            }
++            crate::perf::sample("quadDrawnScreens", a / (1920.0 * 1080.0));
++            crate::perf::sample("nQuadDrawn", n);
++        }
          Ok(InstanceBindings {
              quads: self.write_instance_binding(
                  "quads_bind_group",
@@ -898,3 +1034,22 @@ index bfb081f..7153e91 100644
              )?,
              shadows: self.write_instance_binding(
                  "shadows_bind_group",
+@@ -1800,6 +1943,9 @@ impl WgpuRendererCore {
+         if range.is_empty() {
+             return;
+         }
++        if crate::perf::ENABLED {
++            OC_DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
+         pass.set_pipeline(pipeline);
+         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
+         pass.set_bind_group(1, &instances.bind_group, &[]);
+@@ -2603,6 +2749,8 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
+     }
+ }
+ 
++static OC_DRAWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++
+ fn instance_range(range: Range<usize>) -> Range<u32> {
+     range.start as u32..range.end as u32
+ }
