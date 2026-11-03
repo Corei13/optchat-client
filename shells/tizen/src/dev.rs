@@ -151,8 +151,67 @@ mod imp {
         all.extend_from_slice(cmds);
         let _ = std::fs::write(&path, serde_json::to_string(&all).unwrap_or_default());
     }
+    /// dev perf: a sampling profiler of the ui thread. SIGPROF every ~1 ms for `ms`, the handler keeps (pc, lr);
+    /// the samples and the library's load address go to devsrv /prof (symbolised on the mac: scripts/prof.sh)
+    #[cfg(feature = "perf")]
+    pub mod prof {
+        use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering::Relaxed};
+        const N: usize = 1 << 16;
+        static BUF: [AtomicU32; 2 * N] = [const { AtomicU32::new(0) }; 2 * N];
+        static IDX: AtomicUsize = AtomicUsize::new(0);
+        static ON: AtomicBool = AtomicBool::new(false);
+        static TID: AtomicI32 = AtomicI32::new(0);
+        extern "C" fn on_sig(_: libc::c_int, _: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+            if !ON.load(Relaxed) || ctx.is_null() {
+                return;
+            }
+            let uc = ctx as *const libc::ucontext_t;
+            let (pc, lr) = unsafe { ((*uc).uc_mcontext.arm_pc, (*uc).uc_mcontext.arm_lr) };
+            let i = IDX.fetch_add(1, Relaxed);
+            if i < N {
+                BUF[2 * i].store(pc as u32, Relaxed);
+                BUF[2 * i + 1].store(lr as u32, Relaxed);
+            }
+        }
+        /// on the ui thread, before the ui starts
+        pub fn install() {
+            TID.store(unsafe { libc::syscall(libc::SYS_gettid) } as i32, Relaxed);
+            unsafe {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = on_sig as usize;
+                sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+                libc::sigemptyset(&mut sa.sa_mask);
+                libc::sigaction(libc::SIGPROF, &sa, std::ptr::null_mut());
+            }
+        }
+        pub fn run(ms: u64) {
+            std::thread::spawn(move || {
+                IDX.store(0, Relaxed);
+                ON.store(true, Relaxed);
+                let (pid, tid) = (unsafe { libc::getpid() }, TID.load(Relaxed));
+                let t0 = std::time::Instant::now();
+                let mut sent = 0u32;
+                while t0.elapsed().as_millis() < ms as u128 {
+                    unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGPROF) };
+                    sent += 1;
+                    std::thread::sleep(std::time::Duration::from_micros(1000));
+                }
+                ON.store(false, Relaxed);
+                let n = IDX.load(Relaxed).min(N);
+                let maps: String = std::fs::read_to_string("/proc/self/maps").unwrap_or_default().lines().filter(|l| l.contains(" r-xp ") || l.contains("libocgpui")).collect::<Vec<_>>().join("\n");
+                let mut out = format!("samples {n} sent {sent} ms {ms}\n{maps}\n--\n");
+                for i in 0..n {
+                    out += &format!("{:x} {:x}\n", BUF[2 * i].load(Relaxed), BUF[2 * i + 1].load(Relaxed));
+                }
+                let ok = super::post("/prof", "text/plain", out.as_bytes());
+                super::beacon(&format!("prof {n} samples sent {ok}"));
+            });
+        }
+    }
     /// env for the ui's probes and test channel: before the ui starts
     pub fn init(data: &str) {
+        #[cfg(feature = "perf")]
+        prof::install();
         let p = format!("{data}/probes.json");
         unsafe {
             std::env::set_var("OPTCHAT_PROBES", &p);
@@ -169,6 +228,10 @@ mod imp {
             let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) else { continue };
             if let Some(f) = v["fakemic"].as_bool() {
                 FAKE.store(f, std::sync::atomic::Ordering::SeqCst);
+            }
+            #[cfg(feature = "perf")]
+            if let Some(ms) = v["prof"].as_u64().filter(|m| *m > 0) {
+                prof::run(ms);
             }
             if let Some(c) = v["cmds"].as_array().filter(|c| !c.is_empty()) {
                 queue_cmds(c);

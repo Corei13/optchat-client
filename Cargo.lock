@@ -3874,6 +3874,7 @@ dependencies = [
  "gpui_platform",
  "gpui_wgpu",
  "image",
+ "libc",
  "log",
  "optchat-client",
  "optchat-platform",
