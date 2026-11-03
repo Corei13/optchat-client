@@ -354,13 +354,21 @@ pub fn colors(cx: &App) -> C {
 
 // ---- probes: element bounds for UI tests (OPTCHAT_PROBES=<file>), written as JSON by a background thread ----
 pub static PROBES: OnceLock<Mutex<HashMap<String, [f32; 4]>>> = OnceLock::new();
+/// dev perf A/B (tizen perf bit 131072): probes off at runtime, as in a release build
+pub static PROBES_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn probes_on() -> bool {
-    std::env::var("OPTCHAT_PROBES").is_ok()
+    // read once: the env is set before the ui starts (tests, the tizen dev build)
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OPTCHAT_PROBES").is_ok()) && !PROBES_OFF.load(std::sync::atomic::Ordering::Relaxed)
 }
-/// An invisible absolute child that records its parent's bounds under `name`.
-pub fn probe(name: impl Into<String>) -> impl IntoElement {
+/// An invisible absolute child that records its parent's bounds under `name`; nothing at all (no element, no
+/// layout node) without probes. Use as `.children(probe(..))`.
+pub fn probe(name: impl Into<String>) -> Option<impl IntoElement> {
+    if !probes_on() {
+        return None;
+    }
     let name = name.into();
-    canvas(
+    Some(canvas(
         move |b, _w, _cx| {
             if probes_on() {
                 PROBES.get_or_init(|| Mutex::new(HashMap::new())).lock().insert(name, [f32::from(b.origin.x), f32::from(b.origin.y), f32::from(b.size.width), f32::from(b.size.height)]);
@@ -371,7 +379,7 @@ pub fn probe(name: impl Into<String>) -> impl IntoElement {
     .absolute()
     .size_full()
     .top_0()
-    .left_0()
+    .left_0())
 }
 /// A JSON summary of the app state for UI tests (written next to the probes as `<file>.state.json`).
 pub static STATE_JSON: OnceLock<Mutex<String>> = OnceLock::new();

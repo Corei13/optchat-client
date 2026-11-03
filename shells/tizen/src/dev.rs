@@ -191,6 +191,8 @@ mod imp {
                 gpui_wgpu::perf::set_skip(m as u32);
                 // A/B bit 16384: ambient animations frozen (the old tv behaviour; same as none on screen)
                 optchat_ui::ui::anim::FREEZE.store(m & 16384 != 0, std::sync::atomic::Ordering::Relaxed);
+                // A/B bit 131072: probes off (no probe elements, no per-frame state json), as in a release build
+                optchat_ui::ui::PROBES_OFF.store(m & 131072 != 0, std::sync::atomic::Ordering::Relaxed);
                 // A/B bit 4096: engine redraws uncapped
                 optchat_client::state::set_engine_redraw_gap(if m & 4096 != 0 { 0 } else { optchat_ui::tv::ENGINE_REDRAW_GAP_MS });
             }
