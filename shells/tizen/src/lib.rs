@@ -11,6 +11,11 @@ use std::sync::{Arc, OnceLock};
 mod dev;
 mod platform;
 
+// mimalloc (default feature): the tv's glibc malloc/free was ~a quarter of the ui thread's busy time
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub fn beacon(m: &str) {
     dev::beacon(m)
 }
