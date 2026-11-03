@@ -123,6 +123,8 @@ pub extern "C" fn oc_main() -> i32 {
     unsafe { std::env::set_var("WGPU_GLES_PRESENT_NON_NATIVE", "1") };
     // the whole ui at 1.5× (a 1280×720 layout on the 1080p panel): read from across a room, every view alike
     unsafe { std::env::set_var("GPUI_TIZEN_SCALE", TV_SCALE.to_string()) };
+    // buffer size as a fraction of the 1080p surface, upscaled by the compositor (wl_scaler); build-time knob for A/B
+    unsafe { std::env::set_var("GPUI_TIZEN_RENDER", option_env!("OC_TV_RENDER").unwrap_or("1")) };
     let data = data_dir();
     // linked gl program binaries kept across starts (vendor/wgpu-hal gles): the Mali compile + link of gpui's
     // pipelines is ~2.4 s of a cold start, a cached binary loads in a few ms
