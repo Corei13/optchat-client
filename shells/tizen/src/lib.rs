@@ -125,6 +125,13 @@ pub extern "C" fn oc_main() -> i32 {
     unsafe { std::env::set_var("GPUI_TIZEN_SCALE", TV_SCALE.to_string()) };
     // buffer size as a fraction of the 1080p surface, upscaled by the compositor (wl_scaler); build-time knob for A/B
     unsafe { std::env::set_var("GPUI_TIZEN_RENDER", option_env!("OC_TV_RENDER").unwrap_or("1")) };
+    // redraw only what changed since the last frame (vendor/zed gpui_wgpu damage.rs: the gles swapchain is one
+    // persistent renderbuffer); build-time knob for A/B, default on
+    unsafe { std::env::set_var("GPUI_DAMAGE", option_env!("OC_TV_DAMAGE").unwrap_or("1")) };
+    if cfg!(feature = "dev-capture") {
+        // dev screenshots: the presented pixels plus a full re-render of the same frame, to diff
+        unsafe { std::env::set_var("GPUI_DAMAGE_CHECK", "1") };
+    }
     let data = data_dir();
     // linked gl program binaries kept across starts (vendor/wgpu-hal gles): the Mali compile + link of gpui's
     // pipelines is ~2.4 s of a cold start, a cached binary loads in a few ms
