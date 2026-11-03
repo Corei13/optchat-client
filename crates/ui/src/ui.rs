@@ -81,6 +81,17 @@ pub mod anim {
     pub fn window_active() -> bool {
         ACTIVE.load(Ordering::Relaxed)
     }
+    /// the last remote / key input, ms on `clock()`: the tv's ambient ticks wait while input is being answered
+    static INPUT_MS: AtomicU32 = AtomicU32::new(0);
+    /// dev A/B (tizen perf bit 524288): no hold after input
+    pub static NO_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    pub fn input() {
+        INPUT_MS.store((clock() * 1000.0) as u32 + 1, Ordering::Relaxed);
+    }
+    pub fn input_within(ms: u32) -> bool {
+        let t = INPUT_MS.load(Ordering::Relaxed);
+        !NO_HOLD.load(Ordering::Relaxed) && t != 0 && ((clock() * 1000.0) as u32).saturating_sub(t) < ms
+    }
     pub fn clock() -> f32 {
         static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f32()

@@ -358,6 +358,10 @@ impl Workspace {
             // tv: a frame is tens of ms of its cpu + gpu, so its ambient animations tick at 8 Hz (spinner steps match)
             let ms = if !anim::window_active() { 400 } else if crate::tv::enabled() { 125 } else { 80 };
             Timer::after(std::time::Duration::from_millis(ms)).await;
+            // tv: a key press is answered first (an ambient frame is ~40 ms of cpu + gpu the key would queue behind)
+            if crate::tv::enabled() && anim::input_within(400) {
+                continue;
+            }
             let w = anim::take();
             if w == 0 {
                 if this.upgrade().is_none() {
