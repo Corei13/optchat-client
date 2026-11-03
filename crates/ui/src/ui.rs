@@ -69,6 +69,11 @@ pub mod anim {
     pub fn take() -> u32 {
         WANTED.swap(0, Ordering::Relaxed)
     }
+    /// dev A/B (tizen perf bit 16384): ambient animations stand still and ask for no frames, as with none on screen
+    pub static FREEZE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    pub(crate) fn frozen() -> bool {
+        FREEZE.load(Ordering::Relaxed)
+    }
     static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     pub fn set_window_active(v: bool) {
         ACTIVE.store(v, Ordering::Relaxed);
@@ -83,19 +88,20 @@ pub mod anim {
 }
 
 pub fn spinner(_id: impl Into<ElementId>, size: f32, color: Hsla) -> impl IntoElement {
-    // tv: a full redraw costs ~100 ms on the mali gpu, so spinners and pulses stand still there (no idle redraw)
-    if crate::tv::enabled() {
+    if anim::frozen() {
         return icon("loader-circle", size, color).with_transformation(Transformation::rotate(percentage(0.0)));
     }
+    // asks the ticker for frames only while one is on screen (anim::want); idle stays idle
     anim::want();
-    // 12 steps of 30° per second, in step with the 12.5 Hz ticker
-    let turn = ((anim::clock() * 12.0).floor() / 12.0).fract();
+    // 12 steps of 30° per second, in step with the 12.5 Hz ticker (tv: 8 of 45°, its ticker is 8 Hz)
+    let steps = if crate::tv::enabled() { 8.0 } else { 12.0 };
+    let turn = ((anim::clock() * steps).floor() / steps).fract();
     icon("loader-circle", size, color).with_transformation(Transformation::rotate(percentage(turn)))
 }
 
 /// A soft pulse (opacity) for "live" dots.
 pub fn pulse<E: IntoElement + Styled + 'static>(_id: impl Into<ElementId>, el: E) -> impl IntoElement {
-    if crate::tv::enabled() {
+    if anim::frozen() {
         return el.opacity(1.0);
     }
     anim::want();

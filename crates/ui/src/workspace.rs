@@ -355,7 +355,8 @@ impl Workspace {
             .detach();
         }
         self._ticker = Some(cx.spawn(async move |this, cx| loop {
-            let ms = if anim::window_active() { 80 } else { 400 };
+            // tv: a frame is tens of ms of its cpu + gpu, so its ambient animations tick at 8 Hz (spinner steps match)
+            let ms = if !anim::window_active() { 400 } else if crate::tv::enabled() { 125 } else { 80 };
             Timer::after(std::time::Duration::from_millis(ms)).await;
             let w = anim::take();
             if w == 0 {

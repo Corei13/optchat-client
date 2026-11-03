@@ -134,11 +134,12 @@ mod imp {
         g.clone()
     }
     fn sink(w: u32, h: u32, px: Vec<u8>) {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
         std::thread::spawn(move || {
             let mut png = Vec::new();
             let enc = image::codecs::png::PngEncoder::new_with_quality(&mut png, image::codecs::png::CompressionType::Fast, image::codecs::png::FilterType::Sub);
             if image::ImageEncoder::write_image(enc, &px, w, h, image::ExtendedColorType::Rgba8).is_ok() {
-                let ok = post("/frame", "image/png", &png);
+                let ok = post(&format!("/frame?t={t}"), "image/png", &png);
                 beacon(&format!("cap {w}x{h} png {} sent {ok}", png.len()));
             }
         });
@@ -172,12 +173,24 @@ mod imp {
             if let Some(c) = v["cmds"].as_array().filter(|c| !c.is_empty()) {
                 queue_cmds(c);
             }
+            // a burst: n frames ~ms apart, without forcing redraws (shows whether the app animates by itself)
+            if let Some(n) = v["burst"].as_u64().filter(|n| *n > 0) {
+                let ms = v["burstMs"].as_u64().unwrap_or(150);
+                std::thread::spawn(move || {
+                    for _ in 0..n {
+                        gpui_wgpu::frame_capture::request_capture();
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
+                });
+            }
             if v["shot"].as_bool() == Some(true) {
                 gpui_wgpu::frame_capture::request_capture();
                 queue_cmds(&[serde_json::json!({ "op": "redraw" })]);
             }
             if let Some(m) = v["skip"].as_u64() {
                 gpui_wgpu::perf::set_skip(m as u32);
+                // A/B bit 16384: ambient animations frozen (the old tv behaviour; same as none on screen)
+                optchat_ui::ui::anim::FREEZE.store(m & 16384 != 0, std::sync::atomic::Ordering::Relaxed);
                 // A/B bit 4096: engine redraws uncapped
                 optchat_client::state::set_engine_redraw_gap(if m & 4096 != 0 { 0 } else { optchat_ui::tv::ENGINE_REDRAW_GAP_MS });
             }
