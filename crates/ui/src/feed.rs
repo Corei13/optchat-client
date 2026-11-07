@@ -293,10 +293,33 @@ impl Feed {
     }
 }
 
+/// optchat-file images of a reply (engine meta.images, copied to blobs at reply time): (ref, alt, error).
+pub fn talk_images(e: &LogEntry) -> Vec<(Option<ImageRef>, String, Option<String>)> {
+    let Some(arr) = e.meta.as_ref().and_then(|m| m.get("images")).and_then(|v| v.as_array()) else { return vec![] };
+    arr.iter()
+        .map(|v| {
+            let st = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|x| x.to_string());
+            let u = |k: &str| v.get(k).and_then(|x| x.as_u64());
+            let alt = st("alt").filter(|a| !a.is_empty()).or_else(|| st("name")).unwrap_or_default();
+            let r = st("blob").map(|blob| ImageRef {
+                blob,
+                media_type: st("mediaType").unwrap_or_else(|| "image/png".into()),
+                bytes: u("bytes").unwrap_or(0),
+                name: st("name"),
+                w: u("w").map(|x| x as u32),
+                h: u("h").map(|x| x as u32),
+            });
+            let err = if r.is_none() { Some(st("error").unwrap_or_else(|| "not stored".into())) } else { None };
+            (r, alt, err)
+        })
+        .collect()
+}
+
 fn row_blobs(r: &Row) -> Vec<String> {
     match r {
         Row::User(e) | Row::Parent(e) | Row::Report(e) | Row::Image(e) => e.image.iter().map(|i| i.blob.clone()).collect(),
         Row::Tool { images, .. } => images.iter().filter_map(|e| e.image.as_ref().map(|i| i.blob.clone())).collect(),
+        Row::Talk(e) => talk_images(e).into_iter().filter_map(|(r, _, _)| r.map(|r| r.blob)).collect(),
         _ => vec![],
     }
 }
@@ -1063,6 +1086,24 @@ impl Feed {
         d.into_any_element()
     }
 
+    fn talk_imgs(&mut self, e: &Arc<LogEntry>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let k = c(cx).clone();
+        talk_images(e)
+            .into_iter()
+            .map(|(r, alt, err)| {
+                let mut d = div().mt(zx(8.)).flex().flex_col().items_start().gap(zx(4.));
+                d = match (r, err) {
+                    (Some(r), _) => d.child(self.blob_img(&r, 420., 360., cx)),
+                    (None, err) => d.child(div().text_size(zx(12.5)).text_color(k.text2).child(format!("image not shown: {}", err.unwrap_or_default()))),
+                };
+                if !alt.is_empty() {
+                    d = d.child(div().text_size(zx(12.5)).text_color(k.text2).child(alt));
+                }
+                d.into_any_element()
+            })
+            .collect()
+    }
+
     fn talk(&mut self, e: &Arc<LogEntry>, w: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let k = c(cx).clone();
         let (txt, n) = self.cut_text(e);
@@ -1072,6 +1113,7 @@ impl Feed {
             .id(ElementId::Name(format!("talk{}", e.i).into()))
             .my(zx(8.))
             .child(markdown::render(&format!("t{}", e.i), &doc, &markdown::Opts { size: 14.0, color: k.text }, w, cx))
+            .children(self.talk_imgs(e, cx))
             .children(self.cut_button(e, n, cx))
             .context_menu(move |m, _, _| {
                 m.item(PopupMenuItem::new("Copy markdown").on_click({

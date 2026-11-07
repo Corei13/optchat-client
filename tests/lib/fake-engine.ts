@@ -8,6 +8,12 @@
 // `--big`: a perf fixture instead of the one-line chat: a main chat of 1,770 entries (markdown answers with headings,
 // lists, code blocks and tables, user messages, notes) and five child tasks of 60–200 entries, deterministic.
 const big = Deno.args.includes("--big");
+// `--image=<png>`: the main chat's reply shows that png as an optchat-file image (meta.images, a blob served at
+// /engine/blob/<sha>) plus one the engine could not copy; GET /test/blobs counts the blob fetches
+const imageArg = Deno.args.find((a) => a.startsWith("--image="))?.slice(8);
+const imageBytes = imageArg ? Deno.readFileSync(imageArg) : null;
+const imageSha = imageBytes ? Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", imageBytes)), (b) => b.toString(16).padStart(2, "0")).join("") : "";
+let blobHits = 0;
 const port = Number(Deno.args[0] ?? 18790);
 const list = Deno.args.slice(1).filter((a) => !a.startsWith("--")).map((a, i) => ({ name: a.split(":")[0], running: !a.endsWith(":off"), ...(i === 0 ? { default: true } : {}) }));
 const sockets = new Set<WebSocket>();
@@ -54,6 +60,14 @@ const turnsOf = (task: number, n: number) => Array.from({ length: Math.ceil(n / 
 }));
 const logs: Record<number, any[]> = {};
 for (const t of TASKS) logs[t] = big ? Array.from({ length: SIZES[t] }, (_, i) => entry(t, i)) : [{ i: 0, kind: "talk", size: 40, date: now, text: "Hello from the fake engine." }];
+if (imageBytes) {
+  const text = "Here is the page.\n\n![p0 shot](optchat-file:///tmp/p0.png)\n\nand ![secret](optchat-file:///etc/hosts)";
+  const w = (imageBytes[16] << 24 | imageBytes[17] << 16 | imageBytes[18] << 8 | imageBytes[19]) >>> 0, h = (imageBytes[20] << 24 | imageBytes[21] << 16 | imageBytes[22] << 8 | imageBytes[23]) >>> 0;
+  logs[0].push({ i: 1, kind: "talk", size: text.length, date: now, text, meta: { images: [
+    { src: "optchat-file:///tmp/p0.png", alt: "p0 shot", path: "/tmp/p0.png", blob: imageSha, mediaType: "image/png", w, h, bytes: imageBytes.length, name: "p0.png" },
+    { src: "optchat-file:///etc/hosts", alt: "secret", error: "outside the allowed folders" },
+  ] } });
+}
 const info = (t: number) => ({ task: { id: t, parent: t === 0 ? null : 0, title: t === 0 ? "" : `child task ${t}`, mode: t === 0 ? "root" : "handoff", status: "idle", settings, createdAt: now, startedBy: "user" }, running: false, waiting: false, queue: 0, metrics: big ? { usd: { "*": { own: 51_390_000 / (t + 1), subtree: t === 0 ? 268_040_000 : 2_560_000 / t }, chat: { own: 0, subtree: t === 0 ? 51_390_000 : 0 }, compact: { own: 0, subtree: t === 0 ? 160_860_000 : 0 } }, "time.active": { "*": { own: 0, subtree: t === 0 ? 21_480_000 : 120_000 } }, "tokens.in": { "*": { own: 0, subtree: t === 0 ? 373_690_000 : 12_000 } } } : {} });
 const snapshot = (ws: string, task0: number) => {
   const task = TASKS.includes(task0) ? task0 : 0;
@@ -71,6 +85,8 @@ const snapshot = (ws: string, task0: number) => {
 Deno.serve({ hostname: "127.0.0.1", port, onListen: () => console.log(`fake engine on ${port}`) }, (req) => {
   const url = new URL(req.url);
   if (url.pathname === "/engine/workspaces") return Response.json(list);
+  if (imageBytes && url.pathname === `/engine/blob/${imageSha}`) { blobHits++; return new Response(imageBytes, { headers: { "content-type": "image/png" } }); }
+  if (url.pathname === "/test/blobs") return Response.json({ hits: blobHits, sha: imageSha });
   if (url.pathname === "/test/scope") {
     const next = new Set((url.searchParams.get("set") ?? "").split(",").filter(Boolean));
     for (const [sock, subs] of subsOf) {
