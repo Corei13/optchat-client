@@ -31,6 +31,7 @@ impl TasksPanel {
 }
 impl Render for TasksPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _t = crate::ui::rtime::guard("tasks");
         // a cached view is laid out at the size its parent gives it, so the panel scrolls itself
         crate::ui::anim::area(crate::ui::anim::TASKS);
         let body = self.body(window, cx).into_any_element();
@@ -43,6 +44,99 @@ impl TasksPanel {
     }
 }
 
+/// TV: only tasks that are running (a turn going, or status active) or paused show, plus their ancestors back to the
+/// root so the tree still reads, and the open task's path. None off the TV. Recomputed per render, so it stays live.
+fn tv_live(s: &AppState) -> Option<std::collections::HashSet<i64>> {
+    use optchat_proto::types::TaskStatus;
+    if !crate::tv::enabled() {
+        return None;
+    }
+    let mut keep = std::collections::HashSet::new();
+    let mut mark = |mut id: Option<i64>| {
+        while let Some(i) = id {
+            if !keep.insert(i) {
+                break;
+            }
+            id = s.tasks.get(&i).and_then(|x| x.task.parent);
+        }
+    };
+    for x in s.tasks.values() {
+        if x.running || matches!(x.task.status, TaskStatus::Active | TaskStatus::Paused) {
+            mark(Some(x.task.id));
+        }
+    }
+    mark(Some(s.current));
+    Some(keep)
+}
+
+/// parent -> the children that may show, in `children_of` order, built in one pass over the tasks (the tree walk asked
+/// `children_of` per node and per row: a scan of every task each time, ~1150 tasks on the real workspace)
+fn child_index<'a>(s: &'a AppState, keep: impl Fn(&TaskInfo) -> bool) -> std::collections::HashMap<i64, Vec<&'a TaskInfo>> {
+    let mut m: std::collections::HashMap<i64, Vec<&TaskInfo>> = std::collections::HashMap::new();
+    for x in s.tasks.values() {
+        if let Some(p) = x.task.parent {
+            if keep(x) {
+                m.entry(p).or_default().push(x);
+            }
+        }
+    }
+    m
+}
+
+/// the rows the Tasks view shows, top to bottom: (task, depth, on the path above the current task). Finished tasks are
+/// hidden unless "show ended" is on (always hidden on the TV), except the current one.
+pub fn visible_rows(s: &AppState, collapsed: &std::collections::HashSet<i64>) -> Vec<(TaskInfo, usize, bool)> {
+    let mut rows: Vec<(TaskInfo, usize, bool)> = vec![];
+    let show_ended = s.prefs.show_ended && !crate::tv::enabled();
+    let cur = s.current;
+    let live = tv_live(s);
+    let live = &live;
+    let up: std::collections::HashSet<i64> = s.ancestors(cur).iter().map(|a| a.task.id).collect();
+    let idx = child_index(s, |c| match live {
+        Some(l) => l.contains(&c.task.id),
+        None => show_ended || !c.task.status.terminal() || c.task.id == cur || up.contains(&c.task.id),
+    });
+    struct Ctx<'a> {
+        s: &'a AppState,
+        idx: std::collections::HashMap<i64, Vec<&'a TaskInfo>>,
+        up: std::collections::HashSet<i64>,
+        closed: &'a std::collections::HashSet<i64>,
+        show_ended: bool,
+        cur: i64,
+        live: &'a Option<std::collections::HashSet<i64>>,
+    }
+    fn walk(k: &Ctx, id: i64, depth: usize, out: &mut Vec<(TaskInfo, usize, bool)>) {
+        let Some(x) = k.s.tasks.get(&id) else { return };
+        out.push((x.clone(), depth, false));
+        if k.closed.contains(&id) {
+            return;
+        }
+        for c in k.idx.get(&id).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if let Some(l) = k.live {
+                if l.contains(&c.task.id) {
+                    walk(k, c.task.id, depth + 1, out);
+                }
+                continue;
+            }
+            if k.show_ended || !c.task.status.terminal() || c.task.id == k.cur || k.up.contains(&c.task.id) {
+                walk(k, c.task.id, depth + 1, out);
+            }
+        }
+    }
+    let k = Ctx { s, idx, up, closed: collapsed, show_ended, cur, live };
+    if s.prefs.task_scope_all || crate::tv::enabled() {
+        walk(&k, 0, 0, &mut rows);
+    } else {
+        let up = s.ancestors(cur);
+        let n = up.len();
+        for (d, x) in up.into_iter().enumerate() {
+            rows.push((x.clone(), d, true));
+        }
+        walk(&k, cur, n, &mut rows);
+    }
+    rows
+}
+
 pub fn render(w: &mut TasksPanel, _window: &mut Window, cx: &mut Context<TasksPanel>) -> impl IntoElement {
     let k = c(cx).clone();
     let s = w.state.read(cx);
@@ -50,52 +144,33 @@ pub fn render(w: &mut TasksPanel, _window: &mut Window, cx: &mut Context<TasksPa
     if s.tasks.get(&s.current).is_none() || s.tasks.get(&0).is_none() {
         return list.child(skeleton_line(None, cx)).child(skeleton_line(Some(160.), cx)).child(skeleton_line(None, cx));
     }
-    let mut rows: Vec<(TaskInfo, usize, bool)> = vec![];
-    let show_ended = s.prefs.show_ended;
     let cur = s.current;
-    fn walk(s: &AppState, id: i64, depth: usize, closed: &std::collections::HashSet<i64>, show_ended: bool, cur: i64, out: &mut Vec<(TaskInfo, usize, bool)>) {
-        let Some(x) = s.tasks.get(&id) else { return };
-        out.push((x.clone(), depth, false));
-        if closed.contains(&id) {
-            return;
-        }
-        for c in s.children_of(id) {
-            if show_ended || !c.task.status.terminal() || c.task.id == cur {
-                walk(s, c.task.id, depth + 1, closed, show_ended, cur, out);
-            }
-        }
-    }
-    if s.prefs.task_scope_all {
-        walk(s, 0, 0, &w.collapsed, show_ended, cur, &mut rows);
-    } else {
-        let up = s.ancestors(cur);
-        let n = up.len();
-        for (d, x) in up.into_iter().enumerate() {
-            rows.push((x.clone(), d, true));
-        }
-        walk(s, cur, n, &w.collapsed, show_ended, cur, &mut rows);
-    }
+    let rows = visible_rows(s, &w.collapsed);
     let no_kids = s.children_of(cur).is_empty();
     let up_n = if s.prefs.task_scope_all { 0 } else { s.ancestors(cur).len() };
     let scope_all = s.prefs.task_scope_all;
     set_state_extra("tasksPanel", serde_json::json!({ "rows": rows.len(), "noKids": no_kids && !scope_all, "collapsed": w.collapsed.iter().collect::<Vec<_>>() }));
-    for (x, depth, path) in rows {
-        list = list.child(row(w, &x, depth, path, cx));
+    let kids_of = {
+        let show_all = s.prefs.show_ended && !crate::tv::enabled();
+        let idx = child_index(s, |c| show_all || !c.task.status.terminal() || c.task.id == cur);
+        rows.iter().map(|(x, _, path)| if *path { 0 } else { idx.get(&x.task.id).map_or(0, |v| v.len()) }).collect::<Vec<_>>()
+    };
+    for ((x, depth, path), kids) in rows.into_iter().zip(kids_of) {
+        list = list.child(row(w, &x, depth, path, kids, cx));
     }
     if no_kids && !scope_all {
-        list = list.child(div().pl(px(40. + up_n as f32 * 14.)).py(px(6.)).text_size(px(12.)).text_color(k.faint).child("no subtasks yet").child(probe("tasks.nokids")));
+        list = list.child(div().pl(px(40. + up_n as f32 * 14.)).py(px(6.)).text_size(px(12.)).text_color(k.faint).child("no subtasks yet").children(probe("tasks.nokids")));
     }
     list
 }
 
-fn row(w: &TasksPanel, x: &TaskInfo, depth: usize, path: bool, cx: &mut Context<TasksPanel>) -> impl IntoElement {
+fn row(w: &TasksPanel, x: &TaskInfo, depth: usize, path: bool, kids: usize, cx: &mut Context<TasksPanel>) -> impl IntoElement {
     let k = c(cx).clone();
     let s = w.state.read(cx);
     let t = &x.task;
     let id = t.id;
     let is_cur = id == s.current;
     let ended = t.status.terminal();
-    let kids = if path { 0 } else { s.children_of(id).iter().filter(|c| s.prefs.show_ended || !c.task.status.terminal() || c.task.id == s.current).count() };
     let open = !w.collapsed.contains(&id);
     let usd = sub(Some(x), "usd");
     let active = sub(Some(x), "time.active");
@@ -152,14 +227,14 @@ fn row(w: &TasksPanel, x: &TaskInfo, depth: usize, path: bool, cx: &mut Context<
         .when(is_cur, |d| d.bg(k.accent_bg).text_color(k.text).child(div().absolute().left_0().top(px(6.)).bottom(px(6.)).w(px(2.)).bg(k.accent)))
         .when(!is_cur, |d| d.hover(move |s| s.bg(hover)))
         .relative()
-        .child(probe(format!("trow.{id}")))
+        .children(probe(format!("trow.{id}")))
         .child(
             div()
                 .id(SharedString::from(format!("tw-{id}")))
                 .w(px(12.))
                 .flex_none()
                 .when(kids > 0, |d| {
-                    d.child(chevron(format!("trow{id}"), 13., k.faint, open)).child(probe(format!("trow.chev.{id}"))).on_click(cx.listener(move |w, _, _, cx| {
+                    d.child(chevron(format!("trow{id}"), 13., k.faint, open)).children(probe(format!("trow.chev.{id}"))).on_click(cx.listener(move |w, _, _, cx| {
                         cx.stop_propagation();
                         if !w.collapsed.remove(&id) {
                             w.collapsed.insert(id);
@@ -169,7 +244,7 @@ fn row(w: &TasksPanel, x: &TaskInfo, depth: usize, path: bool, cx: &mut Context<
                 }),
         )
         // the dot has its own tooltip: title, mode, status (with the reason) and the result
-        .child(div().id(SharedString::from(format!("trdot-{id}"))).flex_none().p(px(2.)).child(status_dot(format!("tr{id}"), t.status.as_str(), 8., cx)).child(probe(format!("trow.dot.{id}"))).when(!w.menu_open, |d| d.tooltip(tooltip(dot_tip)))) 
+        .child(div().id(SharedString::from(format!("trdot-{id}"))).flex_none().p(px(2.)).child(status_dot(format!("tr{id}"), t.status.as_str(), 8., cx)).children(probe(format!("trow.dot.{id}"))).when(!w.menu_open, |d| d.tooltip(tooltip(dot_tip)))) 
         .child(
             div()
                 .id(SharedString::from(format!("trtext-{id}")))
