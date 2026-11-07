@@ -124,7 +124,10 @@ fn main() {
             )
             .expect("open window");
         let _ = win;
-        cx.activate(true);
+        // tests launched in the background (open -g -j) stay there
+        if std::env::var("OPTCHAT_TEST_BACKGROUND").is_err() {
+            cx.activate(true);
+        }
 
         // the engines: one websocket per engine (and token), carrying every connected workspace there
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

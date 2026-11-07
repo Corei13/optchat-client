@@ -152,7 +152,10 @@ pub fn parse(text: &str) -> Doc {
                     if inline.is_none() {
                         inline = Some(Inline::default());
                     }
-                    inline.as_mut().unwrap().push(&format!("[image {dest_url}]"), &style);
+                    // optchat-file images show under the reply (engine meta.images); keep only their alt text inline
+                    if !dest_url.starts_with("optchat-file:") {
+                        inline.as_mut().unwrap().push(&format!("[image {dest_url}]"), &style);
+                    }
                 }
                 _ => {}
             },
